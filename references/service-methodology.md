@@ -512,3 +512,140 @@ Marcar con ⚠️ y excluir de métricas de regularidad.
 | `v_fleet` | Datos del buque (TEU, categoría) |
 | `v_escalas_metrics` | Costes ETS y emisiones |
 | `ports` | Zonas y clasificación EEA |
+
+---
+
+## 11. Análisis Comparativo de Períodos (P1 vs P2)
+
+### Objetivo
+
+Cuando se analiza un servicio que ha cambiado entre dos períodos, NO basta con describir el estado actual. Hay que **medir el delta** y **explicar qué lo causó**.
+
+### 11.1 Métricas Obligatorias P1 vs P2
+
+| Métrica | P1 | P2 | Δ | Interpretación |
+|---------|---:|---:|--:|----------------|
+| Escalas | | | | Cambio de frecuencia |
+| TEU | | | | Cambio de capacidad |
+| **KTM** | | | | **Cambio de distancia × capacidad** |
+| Dist. media | | | | Cambio de ruta |
+
+### 11.2 Query de Métricas por Período
+
+```sql
+SELECT
+  CASE WHEN e.start >= '{p1_start}' AND e.start < '{p1_end}' THEN 'P1' ELSE 'P2' END as period,
+  COUNT(*) as escalas,
+  SUM(f.teus) as teus,
+  ROUND(SUM(f.teus * e.prev_leg) / 1000000, 2) as ktm,
+  ROUND(AVG(e.prev_leg)) as dist_media
+FROM escalas e
+JOIN v_fleet f ON e.imo = f.imo
+JOIN econdb_ship_service_ranges s ON e.imo = s.imo
+  AND e.start BETWEEN s.start_range AND COALESCE(s.end_range, '2099-12-31')
+WHERE s.sls_name LIKE '%{SERVICE}%'
+  AND f.fleet = 'containers'
+  AND ((e.start >= '{p1_start}' AND e.start < '{p1_end}')
+    OR (e.start >= '{p2_start}' AND e.start < '{p2_end}'))
+GROUP BY period
+```
+
+### 11.3 Puertos Ganados/Perdidos
+
+```sql
+-- Puertos en P1 que no están en P2 (PERDIDOS)
+SELECT e.portname, p.zone, COUNT(*) as escalas_p1
+FROM escalas e
+JOIN ports p ON e.portname = p.portname
+JOIN econdb_ship_service_ranges s ON e.imo = s.imo
+  AND e.start BETWEEN s.start_range AND COALESCE(s.end_range, '2099-12-31')
+WHERE s.sls_name LIKE '%{SERVICE}%'
+  AND e.start >= '{p1_start}' AND e.start < '{p1_end}'
+  AND e.portname NOT IN (
+    SELECT DISTINCT e2.portname
+    FROM escalas e2
+    JOIN econdb_ship_service_ranges s2 ON e2.imo = s2.imo
+      AND e2.start BETWEEN s2.start_range AND COALESCE(s2.end_range, '2099-12-31')
+    WHERE s2.sls_name LIKE '%{SERVICE}%'
+      AND e2.start >= '{p2_start}' AND e2.start < '{p2_end}'
+  )
+GROUP BY e.portname, p.zone
+ORDER BY escalas_p1 DESC
+```
+
+### 11.4 Interpretación de Cambios de Distancia
+
+| Δ Dist. Media | Posible Causa |
+|---------------|---------------|
+| +30% a +100% | **Cierre de ruta** (Suez, Panamá) → ruta alternativa larga |
+| +10% a +30% | Cambio de hub o añadido de puertos intermedios |
+| -10% a -30% | Optimización de ruta o eliminación de escalas |
+| -30% a -50% | Eliminación de leg largo (pérdida de conectividad intercontinental) |
+
+**CRÍTICO:** Si desaparecen Port Said, Suez, Djibouti o puertos del Mar Rojo → investigar cierre de Suez.
+
+---
+
+## 12. Análisis ETS Comparativo (Hub Switch)
+
+### Cuándo Activar
+
+Cuando un servicio EUROMED-EXTRA cambia su **puerto gateway europeo** entre P1 y P2:
+- Algeciras → Tangier Med
+- Valencia → Port Said
+- Piraeus → Port Said
+
+### 12.1 Query ETS por Puerto Gateway
+
+```sql
+SELECT
+  CASE WHEN e.start >= '{p1_start}' AND e.start < '{p1_end}' THEN 'P1' ELSE 'P2' END as period,
+  e.portname as gateway,
+  p.EEA,
+  COUNT(*) as cruces,
+  ROUND(SUM(em.total_ets_cost_eur), 0) as ets_total,
+  ROUND(AVG(em.total_ets_cost_eur), 0) as ets_medio
+FROM escalas e
+JOIN v_escalas_metrics em ON e.imo = em.imo AND e.start = em.start
+JOIN ports p ON e.portname = p.portname
+JOIN ports p_prev ON e.prev_port = p_prev.portname
+JOIN econdb_ship_service_ranges s ON e.imo = s.imo
+  AND e.start BETWEEN s.start_range AND COALESCE(s.end_range, '2099-12-31')
+WHERE s.sls_name LIKE '%{SERVICE}%'
+  AND e.portname IN ('{GATEWAY_P1}', '{GATEWAY_P2}')
+  AND p.zone IN ('NORTH EUROPE','ATLANTIC','WEST MED','EAST MED')
+  AND p_prev.zone NOT IN ('NORTH EUROPE','ATLANTIC','WEST MED','EAST MED')
+  AND e.start >= '2024-01-01'
+GROUP BY period, e.portname, p.EEA
+ORDER BY period, e.portname
+```
+
+### 12.2 Tabla de Output
+
+| Gateway | EEA | Cruces P1 | ETS P1 (€) | Cruces P2 | ETS P2 (€) | Δ ETS |
+|---------|----:|----------:|-----------:|----------:|-----------:|------:|
+| Algeciras | 0.5 | 27 | €XXX | 0 | €0 | -100% |
+| Tangier Med | 0.0 | 0 | €0 | 13 | €0 | — |
+
+### 12.3 Interpretación
+
+- **EEA = 0.5** (puertos EU): 50% coste ETS en 2024, 100% en 2025+
+- **EEA = 0.0** (puertos no-EU): 0% coste ETS
+
+**Cambio de gateway EEA → no-EEA = carbon leakage operativo**
+
+---
+
+## 13. Checklist Obligatorio Service Analysis
+
+Antes de entregar un Service Analysis, verificar:
+
+| Check | Query/Método | ¿Hecho? |
+|-------|--------------|---------|
+| Métricas P1 vs P2 (escalas, TEU, **KTM**, dist.) | Sección 11.2 | ☐ |
+| Puertos ganados/perdidos | Sección 11.3 | ☐ |
+| Si Δ dist. >30%: investigar causa (Suez, hub) | Sección 11.4 | ☐ |
+| Si servicio EUROMED-EXTRA: ETS por gateway | Sección 12.1 | ☐ |
+| Si cambio de gateway EEA→no-EEA: calcular ahorro | Sección 12.2 | ☐ |
+| Flota desplegada con categoría y fuel | Sección 8.2 | ☐ |
+| Fiabilidad en puerto gateway europeo | Sección 3 | ☐ |

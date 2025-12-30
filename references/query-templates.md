@@ -552,3 +552,69 @@ ORDER BY escalas DESC
 | 70-89% | **Buena** | Servicio fiable con variaciones ocasionales |
 | 50-69% | **Moderada** | Variabilidad significativa |
 | < 50% | **Baja** ⚠️ | Servicio irregular o datos inconsistentes |
+
+### Service KTM Comparison (P1 vs P2)
+
+```sql
+SELECT
+  CASE WHEN e.start >= '{p1_start}' AND e.start < '{p1_end}' THEN 'P1' ELSE 'P2' END as period,
+  COUNT(*) as escalas,
+  ROUND(SUM(f.teus) / 1000, 0) as kteu,
+  ROUND(SUM(f.teus * e.prev_leg) / 1000000, 2) as ktm,
+  ROUND(AVG(e.prev_leg)) as dist_media
+FROM escalas e
+JOIN v_fleet f ON e.imo = f.imo
+JOIN econdb_ship_service_ranges s ON e.imo = s.imo
+  AND e.start BETWEEN s.start_range AND COALESCE(s.end_range, '2099-12-31')
+WHERE s.service_id = {SERVICE_ID}
+  AND f.fleet = 'containers'
+  AND e.prev_leg IS NOT NULL
+  AND ((e.start >= '{p1_start}' AND e.start < '{p1_end}')
+    OR (e.start >= '{p2_start}' AND e.start < '{p2_end}'))
+GROUP BY period
+```
+
+### Service Ports Lost (P1 → P2)
+
+```sql
+SELECT e.portname, p.zone, COUNT(*) as escalas_p1,
+  ROUND(SUM(f.teus * e.prev_leg) / 1000000, 2) as ktm_lost
+FROM escalas e
+JOIN v_fleet f ON e.imo = f.imo
+JOIN ports p ON e.portname = p.portname
+JOIN econdb_ship_service_ranges s ON e.imo = s.imo
+  AND e.start BETWEEN s.start_range AND COALESCE(s.end_range, '2099-12-31')
+WHERE s.service_id = {SERVICE_ID}
+  AND f.fleet = 'containers'
+  AND e.start >= '{p1_start}' AND e.start < '{p1_end}'
+  AND e.portname NOT IN (
+    SELECT DISTINCT e2.portname FROM escalas e2
+    JOIN econdb_ship_service_ranges s2 ON e2.imo = s2.imo
+      AND e2.start BETWEEN s2.start_range AND COALESCE(s2.end_range, '2099-12-31')
+    WHERE s2.service_id = {SERVICE_ID}
+      AND e2.start >= '{p2_start}' AND e2.start < '{p2_end}'
+  )
+GROUP BY e.portname, p.zone
+ORDER BY ktm_lost DESC
+```
+
+### ETS Gateway Comparison
+
+```sql
+SELECT
+  CASE WHEN e.start >= '{p1_start}' AND e.start < '{p1_end}' THEN 'P1' ELSE 'P2' END as period,
+  e.portname, p.EEA, COUNT(*) as entries,
+  ROUND(SUM(em.total_ets_cost_eur), 0) as ets_total
+FROM escalas e
+JOIN v_escalas_metrics em ON e.imo = em.imo AND e.start = em.start
+JOIN ports p ON e.portname = p.portname
+JOIN ports p_prev ON e.prev_port = p_prev.portname
+JOIN econdb_ship_service_ranges s ON e.imo = s.imo
+  AND e.start BETWEEN s.start_range AND COALESCE(s.end_range, '2099-12-31')
+WHERE s.service_id = {SERVICE_ID}
+  AND e.portname IN ('{GATEWAY_1}', '{GATEWAY_2}')
+  AND p.zone IN ('NORTH EUROPE','ATLANTIC','WEST MED','EAST MED')
+  AND p_prev.zone NOT IN ('NORTH EUROPE','ATLANTIC','WEST MED','EAST MED')
+  AND e.start >= '2024-01-01'
+GROUP BY period, e.portname, p.EEA
+```
