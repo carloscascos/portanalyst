@@ -649,3 +649,136 @@ Antes de entregar un Service Analysis, verificar:
 | Si cambio de gateway EEA→no-EEA: calcular ahorro | Sección 12.2 | ☐ |
 | Flota desplegada con categoría y fuel | Sección 8.2 | ☐ |
 | Fiabilidad en puerto gateway europeo | Sección 3 | ☐ |
+
+---
+
+## 14. Rotación Completa de un Servicio
+
+Una **rotación completa** es el ciclo en el que un buque visita todos los puertos del servicio y regresa al punto de origen. Para servicios Asia-Europa típicamente dura 60-120 días.
+
+### 14.1 Técnica para Determinar Fechas
+
+#### Paso 1: Identificar el Hub del Servicio
+
+El hub es el puerto con más escalas de los buques del servicio:
+
+```sql
+SELECT e.portname, COUNT(*) as escalas
+FROM escalas e
+WHERE e.imo IN (
+    SELECT DISTINCT imo
+    FROM econdb_ship_service_ranges
+    WHERE sls_name LIKE '%nombre_servicio%'
+)
+AND e.start >= '2025-01-01'
+GROUP BY e.portname
+ORDER BY escalas DESC
+LIMIT 5;
+```
+
+#### Paso 2: Buscar Visitas Consecutivas al Hub
+
+```sql
+SELECT DATE(start) as fecha, portname
+FROM escalas
+WHERE imo = [IMO_BUQUE]
+  AND portname = '[HUB]'
+  AND start >= '[FECHA_INICIO]'
+ORDER BY start;
+```
+
+#### Paso 3: Delimitar Rotación
+
+El intervalo entre dos visitas consecutivas al hub = una rotación completa.
+
+### 14.2 Ejemplo Práctico: AE5/Gemini
+
+```sql
+-- Paso 1: Identificar hub
+SELECT e.portname, COUNT(*) as escalas
+FROM escalas e
+WHERE e.imo IN (
+    SELECT DISTINCT imo
+    FROM econdb_ship_service_ranges
+    WHERE sls_name LIKE '%AE5%Asia North Europe%'
+)
+AND e.start >= '2025-01-01'
+GROUP BY e.portname
+ORDER BY escalas DESC
+LIMIT 5;
+-- Resultado: Tanjung Pelepas (97), Qianwan (60), Bremerhaven (55)...
+-- Hub identificado: Tanjung Pelepas
+
+-- Paso 2: Obtener buque ejemplo
+SELECT DISTINCT imo, f.name
+FROM econdb_ship_service_ranges ssr
+JOIN v_fleet f ON ssr.imo = f.imo
+WHERE sls_name LIKE '%AE5%Asia North Europe%'
+LIMIT 1;
+-- Resultado: 9778844 (MARSEILLE MAERSK)
+
+-- Paso 3: Encontrar visitas al hub
+SELECT DATE(start) as fecha
+FROM escalas
+WHERE imo = 9778844
+  AND portname = 'Tanjung Pelepas'
+  AND start >= '2025-01-01'
+ORDER BY start;
+-- Resultado: 2025-02-19, 2025-05-09, 2025-05-28...
+
+-- Rotación completa: 2025-02-19 → 2025-05-09 (79 días)
+```
+
+### 14.3 Visualización Route Map
+
+```
+http://34.243.230.153:8000/vessel_map.html?imo=[IMO]&from=[FECHA_HUB_1]&to=[FECHA_HUB_2]
+```
+
+Ejemplo:
+```
+http://34.243.230.153:8000/vessel_map.html?imo=9778844&from=2025-02-19&to=2025-05-09
+```
+
+### 14.4 Criterios de Validación
+
+Una rotación está completa cuando:
+- El buque **vuelve al mismo puerto** (hub de transbordo)
+- Ha visitado **puertos en ambas regiones** (Asia + Europa)
+- La duración es **consistente** con el `duration` del servicio en `econdb_shared_line_service`
+
+---
+
+## 15. Transiciones de Alianza en Servicios Liner
+
+Un servicio liner puede **cambiar de alianza manteniendo el nombre comercial**. Esto implica:
+- Cambio de operadores participantes
+- Posible cambio de flota
+- Modificación de rotación (puertos, frecuencia)
+
+### 15.1 Detección
+
+Usar **búsquedas aproximadas por texto** en tablas econdb:
+
+```sql
+SELECT s.name, ls.operator, ls.alliance,
+       ls.start_date, ls.end_date, s.is_deprecated
+FROM econdb_shared_line_service s
+JOIN econdb_line_service ls ON s.id = ls.shared_line_service_id
+WHERE s.name LIKE '%nombre_servicio%'
+ORDER BY ls.start_date
+```
+
+### 15.2 Indicadores de Transición
+
+| Campo | Señal |
+|-------|-------|
+| `is_deprecated = 1` | Servicio antiguo terminado |
+| `alliance` diferente | Nueva alianza operando |
+| `last_voyage` ≈ `first_voyage` (otro registro) | Fecha de cambio |
+
+### 15.3 Ejemplo: AE5 (2M → Gemini, Feb 2025)
+
+- **Antes**: Maersk + MSC (alianza 2M)
+- **Después**: Maersk + Hapag-Lloyd (alianza Gemini)
+- **Cambios**: Rotación simplificada, London añadido, Escandinavia eliminada
